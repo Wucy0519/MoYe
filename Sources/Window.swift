@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTableViewDataSource, NSTableViewDelegate, WKNavigationDelegate {
     weak var markdownDocument: MarkdownDocument?
     let editor = MarkdownTextView()
-    let editorScroll = NSScrollView()
+    let editorScroll = EditorScrollView()
     let imageHandler = LocalImageHandler()
     var preview: WKWebView!
     let split = NSSplitView()
@@ -19,8 +19,15 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
     var files: [URL] = []
     var folder: URL?
     var pending: DispatchWorkItem?
+    var lineStarts: [Int] = [0]
+    var scrollSyncQueued = false
+    var previewSyncInFlight = false
+    var previewSyncPending = false
+    var latestPreviewTarget = 1.0
     var rendered = RenderedMarkdown(body: "", headings: [])
     var restoringScroll: Double = 0
+    var restoringPosition = 1.0
+    var restoreByLine = true
     var rendering = false
     var ready = false
     var syncScroll = true
@@ -38,6 +45,10 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
     let headingPicker = NSPopUpButton()
     let pdfButton = NSButton()
     let marginPicker = NSPopUpButton()
+    let editorScalePicker = NSPopUpButton()
+    let previewScalePicker = NSPopUpButton()
+    let editorPane = NSView()
+    let previewPane = NSView()
     var formulaButton: SelectionMenuButton?
 
     init(document: MarkdownDocument) {
@@ -68,6 +79,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
         let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal); bar.addArrangedSubview(spacer)
         modeControl.target = self; modeControl.action = #selector(modeSelected); modeControl.selectedSegment = 1
         bar.addArrangedSubview(modeControl)
+        configureScalePickers()
         bar.addArrangedSubview(button("外观", #selector(cycleTheme), symbol: "circle.lefthalf.filled"))
         root.addArrangedSubview(bar)
         split.isVertical = true; split.dividerStyle = .thin; split.autoresizingMask = [.width, .height]
@@ -112,6 +124,8 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
         editor.allowsUndo = true; editor.usesFindBar = true; editor.isIncrementalSearchingEnabled = true
         editor.delegate = self; editor.textContainerInset = NSSize(width: 26, height: 30)
         editor.onSelectionFinished = { [weak self] in self?.scheduleSelectionOptions() }
+        editor.onDropImages = { [weak self] urls, index in self?.insertImageReferences(urls, at: NSRange(location: index, length: 0), alt: "") }
+        editor.registerForDraggedTypes([.fileURL]); editorScroll.registerForDraggedTypes([.fileURL])
         configureSelectionOptions()
         editor.isVerticallyResizable = true; editor.isHorizontallyResizable = false
         editor.minSize = NSSize(width: 0, height: 0); editor.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
@@ -119,12 +133,15 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
         editorScroll.hasVerticalScroller = true; editorScroll.autohidesScrollers = true; editorScroll.documentView = editor
         editorScroll.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(self, selector: #selector(editorScrolled), name: NSView.boundsDidChangeNotification, object: editorScroll.contentView)
-        split.addArrangedSubview(editorScroll)
+        pin(editorScroll, in: editorPane, badge: editorScalePicker)
+        split.addArrangedSubview(editorPane)
         let config = WKWebViewConfiguration(); config.setURLSchemeHandler(imageHandler, forURLScheme: "moye-resource")
         previewScrollHandler.owner = self
         config.userContentController.add(previewScrollHandler, name: "moyeScroll")
         preview = WKWebView(frame: .zero, configuration: config); preview.navigationDelegate = self
-        split.addArrangedSubview(preview)
+        preview.pageZoom = DisplayScale.previewZoom
+        pin(preview, in: previewPane, badge: previewScalePicker)
+        split.addArrangedSubview(previewPane)
         status.font = .monospacedSystemFont(ofSize: 11, weight: .regular); status.textColor = .secondaryLabelColor
         let footer = NSStackView(views: [status]); footer.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
         root.addArrangedSubview(footer)
@@ -139,12 +156,12 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
     deinit { NotificationCenter.default.removeObserver(self); pending?.cancel(); selectionTask?.cancel() }
     func reloadText() {
         editor.string = markdownDocument?.text ?? ""; lastText = editor.string
-        editor.highlight(); requestRender(immediate: true); updateStatus()
+        rebuildLineStarts(); editor.highlight(); requestRender(immediate: true); updateStatus()
     }
     func fileLocationChanged() { imageHandler.root = markdownDocument?.fileURL?.deletingLastPathComponent(); requestRender(immediate: true) }
     func textDidChange(_ notification: Notification) {
         guard editor.string != lastText else { return }
-        lastText = editor.string; markdownDocument?.text = editor.string; markdownDocument?.updateChangeCount(.changeDone)
+        lastText = editor.string; rebuildLineStarts(); markdownDocument?.text = editor.string; markdownDocument?.updateChangeCount(.changeDone)
         requestRender(); updateStatus()
     }
     func textViewDidChangeSelection(_ notification: Notification) { updateStatus(); scheduleSelectionOptions() }
@@ -268,17 +285,101 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
         pending = task
         renderQueue.asyncAfter(deadline: .now() + (immediate ? 0 : 0.22), execute: task)
     }
+    func pin(_ content: NSView, in pane: NSView, badge picker: NSPopUpButton) {
+        content.frame = pane.bounds
+        content.autoresizingMask = [.width, .height]
+        pane.addSubview(content)
+        picker.translatesAutoresizingMaskIntoConstraints = false
+        let plate = NSVisualEffectView()
+        plate.material = .hudWindow; plate.blendingMode = .withinWindow; plate.state = .followsWindowActiveState
+        plate.translatesAutoresizingMaskIntoConstraints = false
+        plate.wantsLayer = true; plate.layer?.cornerRadius = 8; plate.layer?.masksToBounds = true
+        plate.addSubview(picker); pane.addSubview(plate)
+        NSLayoutConstraint.activate([
+            picker.leadingAnchor.constraint(equalTo: plate.leadingAnchor, constant: 6), picker.trailingAnchor.constraint(equalTo: plate.trailingAnchor, constant: -4),
+            picker.topAnchor.constraint(equalTo: plate.topAnchor, constant: 1), picker.bottomAnchor.constraint(equalTo: plate.bottomAnchor, constant: -1),
+            plate.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -16), plate.bottomAnchor.constraint(equalTo: pane.bottomAnchor, constant: -12)
+        ])
+    }
+    func configureScalePickers() {
+        for picker in [editorScalePicker, previewScalePicker] {
+            picker.controlSize = .small; picker.font = .systemFont(ofSize: 11)
+            for percent in DisplayScale.percents {
+                picker.addItem(withTitle: "\(percent)%"); picker.lastItem?.tag = percent
+            }
+        }
+        editorScalePicker.toolTip = "左栏显示比例。只改变屏幕上的字号，不修改文档；缩小后可以放下更多文字。"
+        previewScalePicker.toolTip = "右栏显示比例。只改变屏幕上的字号，不修改文档；缩小后可以放下更多文字。"
+        editorScalePicker.target = self; editorScalePicker.action = #selector(editorScalePicked)
+        previewScalePicker.target = self; previewScalePicker.action = #selector(previewScalePicked)
+        syncScalePickers()
+    }
+    func syncScalePickers() {
+        editorScalePicker.selectItem(withTag: DisplayScale.percent(editor: true))
+        previewScalePicker.selectItem(withTag: DisplayScale.percent(editor: false))
+    }
+    func applyDisplayScales() {
+        editor.highlight()
+        if preview != nil {
+            preview.pageZoom = DisplayScale.previewZoom
+            if ready { preview.evaluateJavaScript("invalidateSourceBlocks()", completionHandler: nil) }
+        }
+        syncScalePickers()
+    }
+    func applyDisplayScalesToOpenWindows() {
+        let controllers = NSDocumentController.shared.documents.flatMap(\.windowControllers).compactMap { $0 as? EditorWindowController }
+        for controller in controllers.isEmpty ? [self] : controllers { controller.applyDisplayScales() }
+    }
+    func stepDisplayScale(_ delta: Int, editor: Bool) {
+        let current = DisplayScale.percent(editor: editor)
+        guard let index = DisplayScale.percents.firstIndex(of: current) else { return }
+        DisplayScale.save(percent: DisplayScale.percents[min(DisplayScale.percents.count - 1, max(0, index + delta))], editor: editor)
+        applyDisplayScalesToOpenWindows()
+    }
+    @objc func editorScalePicked() {
+        DisplayScale.save(percent: editorScalePicker.selectedItem?.tag ?? 100, editor: true)
+        applyDisplayScalesToOpenWindows()
+    }
+    @objc func previewScalePicked() {
+        DisplayScale.save(percent: previewScalePicker.selectedItem?.tag ?? 100, editor: false)
+        applyDisplayScalesToOpenWindows()
+    }
+    @objc func setEditorDisplayScale(_ sender: NSMenuItem) {
+        DisplayScale.save(percent: sender.tag, editor: true); applyDisplayScalesToOpenWindows()
+    }
+    @objc func setPreviewDisplayScale(_ sender: NSMenuItem) {
+        DisplayScale.save(percent: sender.tag, editor: false); applyDisplayScalesToOpenWindows()
+    }
+    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(setEditorDisplayScale(_:)):
+            menuItem.state = menuItem.tag == DisplayScale.percent(editor: true) ? .on : .off
+        case #selector(setPreviewDisplayScale(_:)):
+            menuItem.state = menuItem.tag == DisplayScale.percent(editor: false) ? .on : .off
+        case #selector(toggleScrollSync(_:)):
+            menuItem.state = syncScroll ? .on : .off
+        default:
+            break
+        }
+        return true
+    }
     func loadPreview() {
         imageHandler.root = markdownDocument?.fileURL?.deletingLastPathComponent()
+        preview.pageZoom = DisplayScale.previewZoom
         let title = markdownDocument?.displayName ?? "未命名"
         let html = Markdown.page(rendered, title: title, base: "moye-resource://document/", interactive: true)
-        if ready {
-            preview.evaluateJavaScript("window.scrollY / Math.max(1, document.documentElement.scrollHeight-innerHeight)") { [weak self] value, _ in
-                guard let self else { return }
-                self.restoringScroll = value as? Double ?? 0; self.ready = false; self.rendering = true; self.pdfButton.isEnabled = false
-                self.preview.loadHTMLString(html, baseURL: URL(string: "moye-resource://document/"))
+        let load: (Bool, Double) -> Void = { [weak self] byLine, ratio in
+            guard let self else { return }
+            if byLine { self.restoringPosition = self.editorSourcePosition(); self.restoreByLine = true }
+            else { self.restoringScroll = ratio; self.restoreByLine = false }
+            self.ready = false; self.rendering = true; self.pdfButton.isEnabled = false
+            self.preview.loadHTMLString(html, baseURL: URL(string: "moye-resource://document/"))
+        }
+        if ready && !syncScroll {
+            preview.evaluateJavaScript("window.scrollY / Math.max(1, document.documentElement.scrollHeight-innerHeight)") { value, _ in
+                load(false, value as? Double ?? 0)
             }
-        } else { rendering = true; pdfButton.isEnabled = false; preview.loadHTMLString(html, baseURL: URL(string: "moye-resource://document/")) }
+        } else { load(true, 0) }
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         let revision = renderRevision
@@ -287,7 +388,9 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
             switch result {
             case .success:
                 self.rendering = false; self.ready = true; self.pdfButton.isEnabled = true
-                webView.evaluateJavaScript("setScrollRatio(\(self.restoringScroll))")
+                webView.pageZoom = DisplayScale.previewZoom
+                if self.restoreByLine { webView.evaluateJavaScript("invalidateSourceBlocks(); scrollToLine(\(self.restoringPosition))") }
+                else { webView.evaluateJavaScript("setScrollRatio(\(self.restoringScroll))") }
                 self.updateStatus()
             case .failure(let error):
                 self.rendering = false; self.ready = false; self.pdfButton.isEnabled = false
@@ -317,34 +420,117 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
         bottom.origin.y = max(0, editor.bounds.maxY)
         return max(0, clip.constrainBoundsRect(bottom).origin.y)
     }
+    func rebuildLineStarts() {
+        let text = editor.string as NSString
+        var starts: [Int] = []
+        starts.reserveCapacity(max(1, text.length / 32))
+        var index = 0
+        while index < text.length {
+            starts.append(index)
+            let next = NSMaxRange(text.lineRange(for: NSRange(location: index, length: 0)))
+            if next <= index { break }
+            index = next
+        }
+        lineStarts = starts.isEmpty ? [0] : starts
+    }
+    func lineNumber(at character: Int) -> Int {
+        if lineStarts.count <= 1 { return 1 }
+        var low = 0, high = lineStarts.count - 1
+        while low < high {
+            let mid = (low + high + 1) / 2
+            if lineStarts[mid] <= character { low = mid } else { high = mid - 1 }
+        }
+        return low + 1
+    }
+    func prepareEditorLayout() {
+        if let container = editor.textContainer { editor.layoutManager?.ensureLayout(for: container) }
+    }
+    func fragmentSpan(forLine line: Int) -> (top: CGFloat, height: CGFloat) {
+        guard let layout = editor.layoutManager else { return (0, 1) }
+        let text = editor.string as NSString
+        if text.length == 0 || lineStarts.isEmpty { return (0, 1) }
+        let index = min(max(1, line), lineStarts.count) - 1
+        let start = min(lineStarts[index], text.length - 1)
+        let end = index + 1 < lineStarts.count ? lineStarts[index + 1] : text.length
+        let first = layout.lineFragmentRect(forGlyphAt: layout.glyphIndexForCharacter(at: start), effectiveRange: nil)
+        let lastChar = max(start, min(text.length - 1, end - 1))
+        let last = layout.lineFragmentRect(forGlyphAt: layout.glyphIndexForCharacter(at: lastChar), effectiveRange: nil)
+        return (first.minY + editor.textContainerOrigin.y, max(1, last.maxY - first.minY))
+    }
+    func editorSourcePosition() -> Double {
+        guard let layout = editor.layoutManager, let container = editor.textContainer else { return 1 }
+        let text = editor.string as NSString
+        if text.length == 0 { return 1 }
+        prepareEditorLayout()
+        let containerY = editor.visibleRect.minY - editor.textContainerOrigin.y
+        if containerY <= 0 { return 1 }
+        let glyph = layout.glyphIndex(for: NSPoint(x: 1, y: containerY + 0.5), in: container, fractionOfDistanceThroughGlyph: nil)
+        let character = min(layout.characterIndexForGlyph(at: glyph), text.length - 1)
+        let line = lineNumber(at: character)
+        let span = fragmentSpan(forLine: line)
+        let frac = min(1, max(0, (containerY + editor.textContainerOrigin.y - span.top) / span.height))
+        return Double(line) + Double(frac)
+    }
+    func editorFirstVisibleLine() -> Int { Int(editorSourcePosition().rounded(.down)) }
+    func scrollEditor(to position: Double) {
+        prepareEditorLayout()
+        let clip = editorScroll.contentView
+        let y: CGFloat
+        if position <= 1 { y = 0 }
+        else {
+            let line = max(1, Int(position.rounded(.down)))
+            let frac = min(1, max(0, position - Double(line)))
+            let span = fragmentSpan(forLine: line)
+            y = min(editorScrollExtent, max(0, span.top + CGFloat(frac) * span.height))
+        }
+        clip.scroll(to: NSPoint(x: clip.bounds.minX, y: y))
+        editorScroll.reflectScrolledClipView(clip)
+    }
+    func scrollEditor(toLine line: Int) { scrollEditor(to: Double(max(1, line))) }
+    func syncPreview(to position: Double) {
+        latestPreviewTarget = position
+        if previewSyncInFlight { previewSyncPending = true; return }
+        previewSyncInFlight = true
+        let value = String(format: "%.4f", locale: Locale(identifier: "en_US_POSIX"), position)
+        preview.evaluateJavaScript("scrollToLine(\(value))") { [weak self] _, _ in
+            guard let self else { return }
+            self.previewSyncInFlight = false
+            guard self.previewSyncPending else { return }
+            self.previewSyncPending = false
+            guard self.syncScroll, self.mode == 1, self.ready, !self.applyingPreviewScroll else { return }
+            self.syncPreview(to: self.latestPreviewTarget)
+        }
+    }
     @objc func editorScrolled() {
         selectionPopover.close()
         guard syncScroll, mode == 1, ready, !applyingPreviewScroll else { return }
         let offset = editorScroll.contentView.bounds.minY
-        if let target = previewDrivenEditorY, abs(offset - target) < 1 { return }
+        if let target = previewDrivenEditorY, abs(offset - target) < 1.5 { return }
         previewDrivenEditorY = nil
-        let height = editorScrollExtent
-        let ratio = ScrollSync.ratio(offset: Double(offset), extent: Double(height))
-        restoringScroll = ratio; preview.evaluateJavaScript("setScrollRatio(\(ratio))")
+        if scrollSyncQueued { return }
+        scrollSyncQueued = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.scrollSyncQueued = false
+            guard self.syncScroll, self.mode == 1, self.ready, !self.applyingPreviewScroll else { return }
+            let offset = self.editorScroll.contentView.bounds.minY
+            if let target = self.previewDrivenEditorY, abs(offset - target) < 1.5 { return }
+            self.syncPreview(to: self.editorSourcePosition())
+        }
     }
-    func previewScrolled(ratio: Double) {
+    func previewScrolled(position: Double) {
         guard syncScroll, mode == 1, ready, !rendering else { return }
         selectionTask?.cancel(); selectionPopover.close()
-        let ratio = max(0, min(1, ratio))
-        restoringScroll = ratio
-        let clip = editorScroll.contentView
-        let height = editorScrollExtent
         applyingPreviewScroll = true
-        clip.scroll(to: NSPoint(x: clip.bounds.minX, y: CGFloat(ratio) * height))
-        editorScroll.reflectScrolledClipView(clip)
-        previewDrivenEditorY = clip.bounds.minY
+        scrollEditor(to: max(1, position))
+        previewDrivenEditorY = editorScroll.contentView.bounds.minY
         applyingPreviewScroll = false
     }
     @objc func modeSelected() { mode = modeControl.selectedSegment; applyMode() }
     func applyMode() {
         previewDrivenEditorY = nil
         selectionPopover.close(); selectionTask?.cancel()
-        editorScroll.isHidden = mode == 2; preview.isHidden = mode == 0
+        editorPane.isHidden = mode == 2; previewPane.isHidden = mode == 0
         split.adjustSubviews(); if mode != 2 { window?.makeFirstResponder(editor) }
     }
     @objc func editMode(_ sender: Any?) { mode = 0; modeControl.selectedSegment = 0; applyMode() }
@@ -418,33 +604,33 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
     @objc func codeBlock(_ sender: Any?) { editable(); editor.wrap("\n```\n", "\n```\n", placeholder: "code") }
     @objc func insertTable(_ sender: Any?) { editable(); editor.insertText("\n| 列一 | 列二 |\n| --- | --- |\n| 内容 | 内容 |\n", replacementRange: editor.selectedRange()) }
     @objc func insertLink(_ sender: Any?) { editable(); editor.wrap("[", "](https://example.com)", placeholder: "链接文字") }
+    func insertImageReferences(_ urls: [URL], at range: NSRange, alt: String) {
+        let images = urls.filter(ImagePaths.isImage)
+        guard !images.isEmpty else { return }
+        let document = markdownDocument?.fileURL
+        let body = images.enumerated().map { index, url in
+            ImagePaths.markdown(image: url, document: document, alt: index == 0 ? alt : "")
+        }.joined(separator: "\n")
+        let ns = editor.string as NSString
+        let location = min(max(0, range.location), ns.length)
+        let length = min(max(0, range.length), max(0, ns.length - location))
+        editor.insertText(body, replacementRange: NSRange(location: location, length: length))
+    }
     @objc func insertImage(_ sender: Any?) {
         editable()
         let insertionRange = editor.selectedRange()
-        let panel = NSOpenPanel(); panel.allowedContentTypes = [.image]
+        let selected = insertionRange.length > 0 ? (editor.string as NSString).substring(with: insertionRange) : ""
+        let panel = NSOpenPanel(); panel.allowedContentTypes = [.image]; panel.allowsMultipleSelection = true
         panel.beginSheetModal(for: window!) { [weak self] response in
-            guard response == .OK, let url = panel.url, let self else { return }
-            guard let documentURL = self.markdownDocument?.fileURL else {
-                let alert = NSAlert(); alert.messageText = "请先保存文档"; alert.informativeText = "保存后可以将图片复制到文档旁的 assets 文件夹，让文档和图片一起移动。"; alert.beginSheetModal(for: self.window!); return
-            }
-            do {
-                let directory = documentURL.deletingLastPathComponent().appendingPathComponent("assets", isDirectory: true)
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let destination = directory.appendingPathComponent(UUID().uuidString.prefix(8) + "-" + url.lastPathComponent)
-                try FileManager.default.copyItem(at: url, to: destination)
-                let relative = "assets/" + destination.lastPathComponent
-                let encoded = relative.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "()#?"))) ?? relative
-                self.editor.insertText("![图片](\(encoded))", replacementRange: insertionRange)
-            } catch { NSApp.presentError(error) }
+            guard response == .OK, let self else { return }
+            self.insertImageReferences(panel.urls, at: insertionRange, alt: selected.isEmpty ? "图片" : selected)
         }
     }
     @objc func find(_ sender: NSMenuItem) { editable(); let item = NSMenuItem(); item.tag = sender.tag; editor.performFindPanelAction(item) }
-    @objc func fontLarger(_ sender: Any?) { setFontSize(1) }
-    @objc func fontSmaller(_ sender: Any?) { setFontSize(-1) }
-    func setFontSize(_ delta: Double) {
-        let size = UserDefaults.standard.double(forKey: "editorFontSize").nonzeroOr(15)
-        UserDefaults.standard.set(max(11, min(28, size + delta)), forKey: "editorFontSize"); editor.highlight()
-    }
+    @objc func fontLarger(_ sender: Any?) { stepDisplayScale(1, editor: true) }
+    @objc func fontSmaller(_ sender: Any?) { stepDisplayScale(-1, editor: true) }
+    @objc func previewLarger(_ sender: Any?) { stepDisplayScale(1, editor: false) }
+    @objc func previewSmaller(_ sender: Any?) { stepDisplayScale(-1, editor: false) }
     @objc func saveUTF8(_ sender: Any?) {
         guard let document = markdownDocument else { return }
         let previous = document.sourceEncoding; document.sourceEncoding = .utf8
@@ -471,6 +657,8 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
     @objc func exportPDF(_ sender: Any?) {
         guard ready else { return }
         selectionPopover.close()
+        let zoom = preview.pageZoom
+        preview.pageZoom = 1
         let info = NSPrintInfo.shared.copy() as! NSPrintInfo
         let margin = PDFMargin(rawValue: marginPicker.indexOfSelectedItem) ?? .normal
         info.topMargin = margin.points; info.bottomMargin = margin.points
@@ -478,6 +666,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSTa
         info.isHorizontallyCentered = false; info.isVerticallyCentered = false
         let operation = preview.printOperation(with: info); operation.showsPrintPanel = true; operation.showsProgressPanel = true
         operation.runModal(for: window!, delegate: nil, didRun: nil, contextInfo: nil)
+        preview.pageZoom = zoom
     }
     @objc func marginChanged() { UserDefaults.standard.set(marginPicker.indexOfSelectedItem, forKey: "pdfMargin") }
 }

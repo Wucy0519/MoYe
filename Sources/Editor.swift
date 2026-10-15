@@ -1,7 +1,40 @@
 import AppKit
 
+final class EditorScrollView: NSScrollView {
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { (documentView as? MarkdownTextView)?.dragOperation(for: sender) ?? [] }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { (documentView as? MarkdownTextView)?.dragOperation(for: sender) ?? [] }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { (documentView as? MarkdownTextView)?.dragOperation(for: sender).isEmpty == false }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { (documentView as? MarkdownTextView)?.receiveImageDrop(sender) ?? false }
+}
+
 final class MarkdownTextView: NSTextView {
     var onSelectionFinished: (() -> Void)?
+    var onDropImages: (([URL], Int) -> Void)?
+    func dragOperation(for sender: NSDraggingInfo) -> NSDragOperation {
+        ImagePaths.imageURLs(in: sender.draggingPasteboard).isEmpty ? [] : .copy
+    }
+    func receiveImageDrop(_ sender: NSDraggingInfo) -> Bool {
+        let urls = ImagePaths.imageURLs(in: sender.draggingPasteboard)
+        guard !urls.isEmpty else { return false }
+        let point = convert(sender.draggingLocation, from: nil)
+        let index = bounds.contains(point) ? characterIndexForInsertion(at: point) : (string as NSString).length
+        onDropImages?(urls, index)
+        return true
+    }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let operation = dragOperation(for: sender)
+        return operation.isEmpty ? super.draggingEntered(sender) : operation
+    }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let operation = dragOperation(for: sender)
+        return operation.isEmpty ? super.draggingUpdated(sender) : operation
+    }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        dragOperation(for: sender).isEmpty ? super.prepareForDragOperation(sender) : true
+    }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        receiveImageDrop(sender) || super.performDragOperation(sender)
+    }
     override func mouseDown(with event: NSEvent) {
         super.mouseDown(with: event)
         onSelectionFinished?()
@@ -65,8 +98,8 @@ final class MarkdownTextView: NSTextView {
     func highlight() {
         guard !hasMarkedText(), let storage = textStorage else { return }
         let all = NSRange(location: 0, length: storage.length)
-        let font = NSFont.monospacedSystemFont(ofSize: UserDefaults.standard.double(forKey: "editorFontSize").nonzeroOr(15), weight: .regular)
-        let paragraph = NSMutableParagraphStyle(); paragraph.lineSpacing = 5
+        let font = NSFont.monospacedSystemFont(ofSize: DisplayScale.editorPointSize, weight: .regular)
+        let paragraph = NSMutableParagraphStyle(); paragraph.lineSpacing = 5 * (font.pointSize / 15)
         storage.beginEditing()
         storage.setAttributes([.font: font, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph], range: all)
         let rules: [(String, [NSAttributedString.Key: Any])] = [
@@ -86,4 +119,32 @@ final class MarkdownTextView: NSTextView {
     }
 }
 
-extension Double { func nonzeroOr(_ fallback: Double) -> Double { self == 0 ? fallback : self } }
+enum DisplayScale {
+    static let percents = [50, 60, 70, 80, 90, 100, 125, 150, 200]
+    static let editorKey = "editorDisplayScale"
+    static let previewKey = "previewDisplayScale"
+    static let editorBase = 15.0
+
+    static func nearest(_ percent: Int) -> Int {
+        percents.min { abs($0 - percent) < abs($1 - percent) } ?? 100
+    }
+    static func pointSize(percent: Int) -> Double { editorBase * Double(nearest(percent)) / 100 }
+    static func percent(editor: Bool) -> Int {
+        let key = editor ? editorKey : previewKey
+        if UserDefaults.standard.object(forKey: key) != nil {
+            return nearest(Int((UserDefaults.standard.double(forKey: key) * 100).rounded()))
+        }
+        if editor {
+            let points = UserDefaults.standard.double(forKey: "editorFontSize")
+            if points > 0 { return nearest(Int((points / editorBase * 100).rounded())) }
+        }
+        return 100
+    }
+    static func save(percent: Int, editor: Bool) {
+        let scale = Double(nearest(percent)) / 100
+        UserDefaults.standard.set(scale, forKey: editor ? editorKey : previewKey)
+        if editor { UserDefaults.standard.set(editorBase * scale, forKey: "editorFontSize") }
+    }
+    static var editorPointSize: CGFloat { CGFloat(pointSize(percent: percent(editor: true))) }
+    static var previewZoom: CGFloat { CGFloat(percent(editor: false)) / 100 }
+}

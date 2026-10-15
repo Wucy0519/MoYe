@@ -94,8 +94,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(view, "双栏同步滚动", #selector(EditorWindowController.toggleScrollSync(_:))); view.items.last?.state = .on
         add(view, "刷新文件列表", #selector(EditorWindowController.refreshFiles))
         add(view, "切换外观（系统 / 浅色 / 深色）", #selector(EditorWindowController.cycleTheme))
-        add(view, "增大编辑字号", #selector(EditorWindowController.fontLarger(_:)), "+")
-        add(view, "减小编辑字号", #selector(EditorWindowController.fontSmaller(_:)), "-")
+        func scaleMenu(_ action: Selector) -> NSMenu {
+            let menu = NSMenu()
+            for percent in DisplayScale.percents {
+                let item = NSMenuItem(title: "\(percent)%", action: action, keyEquivalent: "")
+                item.tag = percent; menu.addItem(item)
+            }
+            return menu
+        }
+        let editorScale = NSMenuItem(title: "左栏显示比例", action: nil, keyEquivalent: "")
+        editorScale.submenu = scaleMenu(#selector(EditorWindowController.setEditorDisplayScale(_:))); view.addItem(editorScale)
+        let previewScale = NSMenuItem(title: "右栏显示比例", action: nil, keyEquivalent: "")
+        previewScale.submenu = scaleMenu(#selector(EditorWindowController.setPreviewDisplayScale(_:))); view.addItem(previewScale)
+        add(view, "增大左栏字号", #selector(EditorWindowController.fontLarger(_:)), "+")
+        add(view, "减小左栏字号", #selector(EditorWindowController.fontSmaller(_:)), "-")
+        add(view, "增大右栏字号", #selector(EditorWindowController.previewLarger(_:)), "+", [.command, .option])
+        add(view, "减小右栏字号", #selector(EditorWindowController.previewSmaller(_:)), "-", [.command, .option])
         let windows = section("窗口"); NSApp.windowsMenu = windows
         add(windows, "最小化", #selector(NSWindow.performMiniaturize(_:)), "m")
         add(windows, "缩放", #selector(NSWindow.performZoom(_:)))

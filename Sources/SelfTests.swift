@@ -6,8 +6,8 @@ enum SelfTests {
         let sample = "# 中文 **标题**\n\n## 子标题\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n- [x] 完成\n- [ ] 待办\n\n~~删除~~\n\n```swift\nlet x = 1\n```\n\nhttps://example.com\n\n<script>alert(1)</script>\n\n[危险](javascript:alert(1))\n"
         let rendered = Markdown.render(sample)
         check(rendered.headings.count == 2 && rendered.headings[0].title == "中文 标题" && rendered.headings[1].line == 3, "大纲解析中文、内联格式和行号")
-        check(rendered.body.contains("id=\"heading-0\""), "标题锚点")
-        check(rendered.body.contains("<table>") && rendered.body.contains("<del>删除</del>"), "GFM 表格和删除线")
+        check(rendered.body.contains("id=\"heading-0\"") && rendered.body.contains("data-sourcepos=\"1:"), "标题锚点与源码行号")
+        check(rendered.body.contains("<table") && rendered.body.contains("<del>删除</del>"), "GFM 表格和删除线")
         check(rendered.body.contains("type=\"checkbox\"") && rendered.body.contains("checked"), "任务列表")
         check(rendered.body.contains("language-swift") && rendered.body.contains("https://example.com"), "代码块与自动链接")
         check(!rendered.body.contains("<script>") && !rendered.body.contains("href=\"javascript:"), "过滤原始 HTML 和危险链接")
@@ -21,6 +21,34 @@ enum SelfTests {
         let codeMath = Markdown.render("`$x$`\n\n```tex\n$$\\frac{a}{b}$$\n```\n\n    $indented$\n\n价格 \\$20 和 $30")
         check(!codeMath.body.contains("moye-math"), "代码块、行内代码、缩进代码和货币跳过数学渲染")
         check(Markdown.render("$x$ $y$ $z$").body.components(separatedBy: "class=\"moye-math\"").count == 4, "多个单字符公式识别")
+        check(DisplayScale.nearest(1) == 50 && DisplayScale.nearest(110) == 100 && DisplayScale.nearest(140) == 150, "显示比例就近落到固定档位")
+        check(DisplayScale.percents.contains(50) && DisplayScale.percents.last == 200, "显示比例可缩小或放大")
+        check(DisplayScale.pointSize(percent: 100) == 15 && DisplayScale.pointSize(percent: 50) == 7.5, "左栏字号按显示比例缩放")
+        do {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("moye-images-" + UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let document = directory.appendingPathComponent("笔记.md")
+            let same = directory.appendingPathComponent("封面.png")
+            let nestedDir = directory.appendingPathComponent("assets", isDirectory: true)
+            try FileManager.default.createDirectory(at: nestedDir, withIntermediateDirectories: true)
+            let nested = nestedDir.appendingPathComponent("内图.png")
+            let spaced = directory.appendingPathComponent("my photo.png")
+            let outsideDir = FileManager.default.temporaryDirectory.appendingPathComponent("moye-outside-" + UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: outsideDir) }
+            for url in [document, same, nested, spaced] { try Data("x".utf8).write(to: url) }
+            let outside = outsideDir.appendingPathComponent("外图.png")
+            try Data("x".utf8).write(to: outside)
+            check(ImagePaths.reference(image: same, document: document) == "封面.png", "同目录图片使用相对路径")
+            check(ImagePaths.reference(image: nested, document: document) == "assets/内图.png", "子目录图片使用相对路径")
+            check(ImagePaths.reference(image: outside, document: document) == ImagePaths.normalized(outside).path, "其他目录图片使用绝对路径")
+            check(ImagePaths.reference(image: same, document: nil) == ImagePaths.normalized(same).path, "未保存文档使用绝对路径")
+            check(ImagePaths.markdown(image: same, document: document, alt: "选中说明") == "![选中说明](封面.png)", "选中文字作为图片说明")
+            check(ImagePaths.markdown(image: spaced, document: document, alt: "图") == "![图](<my photo.png>)", "带空格的路径可以写入 Markdown")
+            let spacedHTML = Markdown.render(ImagePaths.markdown(image: spaced, document: document, alt: "图")).body
+            check(spacedHTML.contains("my%20photo.png") || spacedHTML.contains("my photo.png"), "带空格的图片路径可以进入预览")
+        } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
         check(!MathRuntime.script.isEmpty && MathRuntime.script.contains("MathJax"), "应用内离线 MathJax 资源可读取")
         let bold = Formatting.emphasis(in: "中文😀", selection: NSRange(location: 0, length: 4), marker: "**")
         check(bold.replacement == "**中文😀**" && bold.selection == NSRange(location: 2, length: 4), "加粗保留中文及 emoji 选区")
@@ -71,6 +99,49 @@ enum SelfTests {
         check(editor.string == "\n", "空列表回车退出")
         editor.string = "中文😀"; editor.setSelectedRange(NSRange(location: 0, length: 4)); editor.wrap("**", "**")
         check(editor.string == "**中文😀**" && editor.selectedRange().length == 4, "格式操作使用正确 UTF-16 选区")
+        let savedEditorScale = UserDefaults.standard.object(forKey: DisplayScale.editorKey)
+        let savedPreviewScale = UserDefaults.standard.object(forKey: DisplayScale.previewKey)
+        let savedEditorFont = UserDefaults.standard.object(forKey: "editorFontSize")
+        func restoreDisplayScale() {
+            func restore(_ key: String, _ value: Any?) {
+                if let value { UserDefaults.standard.set(value, forKey: key) } else { UserDefaults.standard.removeObject(forKey: key) }
+            }
+            restore(DisplayScale.editorKey, savedEditorScale)
+            restore(DisplayScale.previewKey, savedPreviewScale)
+            restore("editorFontSize", savedEditorFont)
+        }
+        func checkScale(_ condition: Bool, _ message: String) {
+            if !condition { restoreDisplayScale(); fputs("FAIL: \(message)\n", stderr); exit(1) }
+            print("PASS: \(message)")
+        }
+        UserDefaults.standard.set(1.0, forKey: DisplayScale.editorKey)
+        UserDefaults.standard.set(1.0, forKey: DisplayScale.previewKey)
+        let document = MarkdownDocument()
+        document.text = String(repeating: "很多文字需要缩小显示才能在一屏里放下。", count: 40)
+        let original = document.text
+        let controller = EditorWindowController(document: document)
+        controller.window?.setContentSize(NSSize(width: 1200, height: 800))
+        func bodyHeight() -> CGFloat {
+            guard let container = controller.editor.textContainer else { return 0 }
+            container.widthTracksTextView = false
+            container.containerSize = NSSize(width: 420, height: CGFloat.greatestFiniteMagnitude)
+            controller.editor.layoutManager?.ensureLayout(for: container)
+            return controller.editor.layoutManager?.usedRect(for: container).height ?? 0
+        }
+        let fullHeight = bodyHeight()
+        checkScale(controller.editorScalePicker.selectedItem?.tag == 100 && controller.previewScalePicker.selectedItem?.tag == 100, "左右栏默认按 100% 显示")
+        checkScale(abs(controller.preview.pageZoom - 1) < 0.001, "右栏默认不缩放")
+        controller.editorScalePicker.selectItem(withTag: 50); controller.editorScalePicked()
+        controller.previewScalePicker.selectItem(withTag: 50); controller.previewScalePicked()
+        let compactHeight = bodyHeight()
+        let font = controller.editor.textStorage?.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        checkScale(abs((font?.pointSize ?? 0) - 7.5) < 0.2 && compactHeight < fullHeight * 0.75, "缩小左栏后同样宽度能放下更多文字")
+        checkScale(abs(controller.preview.pageZoom - 0.5) < 0.001, "缩小右栏只改变预览缩放")
+        checkScale(document.text == original, "调整显示比例不修改文档")
+        controller.previewScalePicker.selectItem(withTag: 200); controller.previewScalePicked()
+        checkScale(abs(controller.preview.pageZoom - 2) < 0.001, "放大右栏预览")
+        controller.window?.orderOut(nil)
+        restoreDisplayScale()
         editor.undoManager?.undo(); check(editor.string == "中文😀", "格式操作可撤销")
         print("全部自检通过")
     }
@@ -98,31 +169,34 @@ enum SelfTests {
             controller.preview.evaluateJavaScript(script) { result, _ in value = result as? Double; done = true }
             _ = waitFor { done }; return value
         }
-        func editorRatio() -> Double {
-            ScrollSync.ratio(offset: Double(controller.editorScroll.contentView.bounds.minY), extent: Double(controller.editorScrollExtent))
+        func editorLine() -> Int { controller.editorFirstVisibleLine() }
+        func previewLine() -> Int { Int((evaluate("lineAtTop()") ?? -100).rounded()) }
+        let source = controller.editor.string as NSString
+        func sourceLine(_ needle: String) -> Int {
+            let found = source.range(of: needle)
+            guard found.location != NSNotFound else { return -1 }
+            return source.substring(to: found.location).filter { $0 == "\n" }.count + 1
         }
-        let ratioScript = "window.scrollY/Math.max(1,document.documentElement.scrollHeight-innerHeight)"
-        // Use ordinary scrolling, not setScrollRatio: it represents user-driven preview movement.
-        _ = evaluate("window.scrollTo(0,0.5*(document.documentElement.scrollHeight-innerHeight)); 0")
-        let previewSynced = waitFor { abs(editorRatio() - 0.5) < 0.015 }
-        check(previewSynced, "右侧滚动带动左侧编辑区")
-        let clip = controller.editorScroll.contentView
-        clip.scroll(to: NSPoint(x: 0, y: 0.8 * controller.editorScrollExtent))
-        controller.editorScroll.reflectScrolledClipView(clip)
-        check(waitFor { abs((evaluate(ratioScript) ?? -1) - 0.8) < 0.015 }, "左侧滚动带动右侧预览")
-        _ = evaluate("window.scrollTo(0,document.documentElement.scrollHeight); 0")
-        let bottomSynced = waitFor { abs(editorRatio() - 1) < 0.015 }
-        if !bottomSynced { print("底部诊断：\(editorRatio()) offset=\(clip.bounds.minY) extent=\(controller.editorScrollExtent) frame=\(controller.editor.frame.height) preview=\(evaluate(ratioScript) ?? -1)") }
-        check(bottomSynced, "预览滚动到底部时编辑区同步到底部")
+        let line20 = sourceLine("## 第 20 节")
+        let line6 = sourceLine("## 第 6 节")
+        _ = evaluate("(function(){const item=sourceBlocks().find(i=>i.start===\(line20)); if(!item) return -1; window.scrollTo(0,item.top); return item.top;})()")
+        let previewSynced = waitFor { abs(editorLine() - line20) <= 1 }
+        if !previewSynced { print("预览诊断：editor=\(editorLine()) preview=\(previewLine()) target=\(line20) pane=\(controller.editorPane.frame) scroll=\(controller.editorScroll.frame) text=\(controller.editor.frame) extent=\(controller.editorScrollExtent)") }
+        check(previewSynced, "右侧滚动后左侧首行对应该节")
+        controller.scrollEditor(toLine: line6)
+        let editorSynced = waitFor { abs(previewLine() - line6) <= 1 }
+        if !editorSynced { print("编辑诊断：editor=\(editorLine()) preview=\(previewLine()) target=\(line6)") }
+        check(editorSynced, "左侧滚动后右侧首行对应该节")
+        let frozen = editorLine()
         controller.syncScroll = false
         _ = evaluate("window.scrollTo(0,0); 0")
         RunLoop.current.run(until: Date().addingTimeInterval(0.25))
-        check(abs(editorRatio() - 1) < 0.015, "关闭同步后两栏独立滚动")
+        check(editorLine() == frozen, "关闭同步后两栏独立滚动")
         controller.syncScroll = true
-        _ = evaluate("window.scrollTo(0,0.25*(document.documentElement.scrollHeight-innerHeight)); 0")
-        check(waitFor { abs(editorRatio() - 0.25) < 0.015 }, "重新开启同步后恢复双向滚动")
+        _ = evaluate("(function(){const item=sourceBlocks().find(i=>i.start===\(line20)); window.scrollTo(0,item.top); return 0;})()")
+        check(waitFor { abs(editorLine() - line20) <= 1 && abs(previewLine() - line20) <= 1 }, "重新开启同步后首行重新对应")
         RunLoop.current.run(until: Date().addingTimeInterval(0.5))
-        check(abs(editorRatio() - 0.25) < 0.015 && abs((evaluate(ratioScript) ?? -1) - 0.25) < 0.015, "两栏同步后位置稳定，无循环反馈")
+        check(abs(editorLine() - line20) <= 1 && abs(previewLine() - line20) <= 1, "两栏停住后首行保持对应，无循环反馈")
         controller.window?.orderOut(nil)
         print("全部双栏滚动集成检查通过")
     }

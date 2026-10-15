@@ -30,7 +30,8 @@ enum Markdown {
         let math = MathSource(text)
         let protected = math.markdown
         registerExtensions()
-        guard let parser = parserNew(1 << 9) else { return RenderedMarkdown(body: "", headings: []) }
+        let sourcePos: Int32 = 1 << 1
+        guard let parser = parserNew(sourcePos | (1 << 9)) else { return RenderedMarkdown(body: "", headings: []) }
         defer { parserFree(parser) }
         for name in ["table", "strikethrough", "autolink", "tasklist", "tagfilter"] {
             name.withCString { if let ext = findExtension($0) { _ = attachExtension(parser, ext) } }
@@ -53,10 +54,10 @@ enum Markdown {
             while let current = child { walk(current); child = nextNode(current) }
         }
         walk(root)
-        guard let output = renderHTML(root, 0, getExtensions(parser)) else { return RenderedMarkdown(body: "", headings: headings) }
+        guard let output = renderHTML(root, sourcePos, getExtensions(parser)) else { return RenderedMarkdown(body: "", headings: headings) }
         defer { free(output) }
         var body = math.restore(String(cString: output))
-        if let regex = try? NSRegularExpression(pattern: "<h[1-6]>") {
+        if let regex = try? NSRegularExpression(pattern: "<h([1-6])([^>]*)>") {
             let matches = regex.matches(in: body, range: NSRange(body.startIndex..., in: body))
             for (index, match) in matches.enumerated().reversed() {
                 let range = Range(match.range, in: body)!
